@@ -5,8 +5,10 @@ Runs after the API container is healthy (see docker-compose.yml) and:
 1. runs the code test suite,
 2. performs a build sanity check (byte-compilation of every module),
 3. exercises the HTTP API with a consistent chain (including two paths
-   that must agree), a contradictory cycle, an unreachable pair and an
-   invalid relation,
+   that must agree), a redundant single_relation chain, a chain that fails
+   resilience (422 with sorted criticalRelationIds and no coefficients),
+   parallel relations counted as independent evidence, a contradictory
+   cycle, an unreachable pair and an invalid relation,
 
 then prints a summary and exits non-zero if anything failed.
 """
@@ -93,6 +95,11 @@ def smoke() -> None:
         and body.get("results") == ["5/6", "11/6", "10/3"],
         f"status={status} body={body}",
     )
+    check(
+        "legacy contract omits the resilience field",
+        "resilience" not in body,
+        f"body={body}",
+    )
 
     diamond = {
         "source": "A",
@@ -111,6 +118,100 @@ def smoke() -> None:
         status == 200
         and body.get("coefficients") == {"a": "1", "b": "5/6"}
         and body.get("results") == ["17/6"],
+        f"status={status} body={body}",
+    )
+
+    resilient_diamond = {
+        "source": "A",
+        "target": "C",
+        "resilience": "single_relation",
+        "relations": [
+            {"from": "A", "to": "B", "a": "2", "b": "1", "relationId": "ab"},
+            {"from": "A", "to": "D", "a": "4", "b": "2", "relationId": "ad"},
+            {"from": "B", "to": "C", "a": "1/2", "b": "1/3", "relationId": "bc"},
+            {"from": "D", "to": "C", "a": "1/4", "b": "1/3", "relationId": "dc"},
+        ],
+        "readings": ["2"],
+    }
+    status, body = post(resilient_diamond)
+    check(
+        "redundant diamond survives every single-relation revocation",
+        status == 200
+        and body.get("coefficients") == {"a": "1", "b": "5/6"}
+        and body.get("results") == ["17/6"]
+        and body.get("resilience") == {"mode": "single_relation", "verified": True},
+        f"status={status} body={body}",
+    )
+
+    fragile = {
+        "source": "A",
+        "target": "C",
+        "resilience": "single_relation",
+        "relations": [
+            {"from": "A", "to": "B", "a": "2", "b": "1", "relationId": "r1"},
+            {"from": "B", "to": "C", "a": "1/2", "b": "1/3", "relationId": "r2"},
+        ],
+        "readings": ["2"],
+    }
+    status, body = post(fragile)
+    error = body.get("error", {})
+    check(
+        "single chain fails resilience: 422, sorted ids, no coefficients",
+        status == 422
+        and error.get("code") == "resilience_not_met"
+        and error.get("criticalRelationIds") == ["r1", "r2"]
+        and "coefficients" not in body
+        and "results" not in body,
+        f"status={status} body={body}",
+    )
+
+    parallel = {
+        "source": "A",
+        "target": "C",
+        "resilience": "single_relation",
+        "relations": [
+            {"from": "A", "to": "B", "a": "2", "b": "1", "relationId": "p1"},
+            {"from": "A", "to": "B", "a": "2", "b": "1", "relationId": "p2"},
+            {"from": "B", "to": "C", "a": "1/2", "b": "1/3", "relationId": "p3"},
+        ],
+        "readings": ["2"],
+    }
+    status, body = post(parallel)
+    error = body.get("error", {})
+    check(
+        "parallel relations count independently; lone tail link is critical",
+        status == 422
+        and error.get("criticalRelationIds") == ["p3"],
+        f"status={status} body={body}",
+    )
+
+    resilient_conflict = {
+        "source": "A",
+        "target": "C",
+        "resilience": "single_relation",
+        "relations": [
+            {"from": "A", "to": "B", "a": "2", "b": "1", "relationId": "r1"},
+            {"from": "B", "to": "C", "a": "3", "b": "0", "relationId": "r2"},
+            {"from": "C", "to": "A", "a": "1/6", "b": "0", "relationId": "r3"},
+        ],
+        "readings": ["1"],
+    }
+    status, body = post(resilient_conflict)
+    check(
+        "contradiction beats resilience with original 409 verdict",
+        status == 409 and body.get("error", {}).get("code") == "conflict",
+        f"status={status} body={body}",
+    )
+
+    missing_ids = dict(fragile)
+    missing_ids["relations"] = [
+        {"from": "A", "to": "B", "a": "2", "b": "1"},
+        {"from": "B", "to": "C", "a": "1/2", "b": "1/3"},
+    ]
+    status, body = post(missing_ids)
+    check(
+        "single_relation mode requires unique non-empty relationId",
+        status == 400 and body.get("error", {}).get("code") == "invalid_request",
         f"status={status} body={body}",
     )
 

@@ -61,6 +61,21 @@ class CalibrationConflict(CalibrationError):
         self.detail = detail
 
 
+class ResilienceNotMet(CalibrationError):
+    """Revoking a single relation breaks every source->target evidence chain."""
+
+    code = "resilience_not_met"
+    status = 422
+
+    def __init__(self, source: str, target: str, critical_relation_ids: Iterable[str]) -> None:
+        self.critical_relation_ids = sorted(set(critical_relation_ids))
+        ids = ", ".join(self.critical_relation_ids)
+        super().__init__(
+            f"translation {source!r}->{target!r} has no independent backup chain "
+            f"when any of these relations is revoked: {ids}"
+        )
+
+
 @dataclass(frozen=True)
 class Affine:
     """An affine transform ``y = a*x + b`` with exact rational coefficients."""
@@ -90,6 +105,7 @@ class Relation:
     to: str
     a: Fraction
     b: Fraction
+    relation_id: str | None = None
 
     def as_adjacency(self) -> tuple[str, str, Affine]:
         return self.frm, self.to, Affine(self.a, self.b)
@@ -149,6 +165,24 @@ def _require_str(value: object, field_name: str) -> str:
     return value.strip()
 
 
+def _parse_resilience(value: object) -> str | None:
+    """Parse the optional ``resilience`` selector.
+
+    Absent or ``None`` keeps the original contract (no resilience checks).
+    Currently only ``"single_relation"`` is supported.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise InvalidRequest("field 'resilience' must be a non-empty string")
+    mode = value.strip()
+    if mode != "single_relation":
+        raise InvalidRequest(
+            f"field 'resilience'={value!r} is not supported; use 'single_relation'"
+        )
+    return mode
+
+
 def _extract_readings(payload: Mapping[str, object]) -> list:
     if "readings" not in payload:
         raise InvalidRequest("field 'readings' is required")
@@ -169,9 +203,11 @@ class TranslationResult:
     transform: Affine
     readings_in: list[Fraction] = field(default_factory=list)
     readings_out: list[Fraction] = field(default_factory=list)
+    resilience_mode: str | None = None
+    resilience_verified: bool = False
 
     def to_json(self) -> dict:
-        return {
+        payload = {
             "source": self.source,
             "target": self.target,
             "coefficients": {
@@ -181,15 +217,22 @@ class TranslationResult:
             "readings": [render_fraction(x) for x in self.readings_in],
             "results": [render_fraction(y) for y in self.readings_out],
         }
+        if self.resilience_mode is not None:
+            payload["resilience"] = {
+                "mode": self.resilience_mode,
+                "verified": self.resilience_verified,
+            }
+        return payload
 
 
 def translate(payload: Mapping[str, object]) -> TranslationResult:
     """Validate a request and translate readings from source to target.
 
-    Raises :class:`InvalidRequest`, :class:`Unreachable` or
-    :class:`CalibrationConflict`.  The answer never depends on the order in
-    which relations were entered: every edge is checked against every path
-    already derived, and a mismatch rejects the whole request.
+    Raises :class:`InvalidRequest`, :class:`Unreachable`,
+    :class:`CalibrationConflict` or :class:`ResilienceNotMet`.  The answer
+    never depends on the order in which relations were entered: every edge is
+    checked against every path already derived, and a mismatch rejects the
+    whole request.
     """
     if not isinstance(payload, Mapping):
         raise InvalidRequest("request body must be a JSON object")
@@ -205,9 +248,11 @@ def translate(payload: Mapping[str, object]) -> TranslationResult:
     source = _require_str(payload.get("source"), "field 'source'")
     target = _require_str(payload.get("target"), "field 'target'")
     raw_readings = _extract_readings(payload)
+    resilience_mode = _parse_resilience(payload.get("resilience"))
 
     relations: list[Relation] = []
     vertices: set[str] = set()
+    seen_ids: set[str] = set()
     for index, item in enumerate(relations_raw):
         where = f"relations[{index}]"
         if not isinstance(item, Mapping):
@@ -220,7 +265,15 @@ def translate(payload: Mapping[str, object]) -> TranslationResult:
         if a == 0:
             raise InvalidRequest(f"{where}.a must not be zero")
         b = parse_rational(item.get("b", 0), f"{where}.b")
-        relations.append(Relation(frm, to, a, b))
+        relation_id = None
+        if resilience_mode == "single_relation":
+            relation_id = _require_str(item.get("relationId"), f"{where}.relationId")
+            if relation_id in seen_ids:
+                raise InvalidRequest(
+                    f"{where}.relationId={relation_id!r} is not unique across relations"
+                )
+            seen_ids.add(relation_id)
+        relations.append(Relation(frm, to, a, b, relation_id))
         vertices.add(frm)
         vertices.add(to)
 
@@ -236,12 +289,82 @@ def translate(payload: Mapping[str, object]) -> TranslationResult:
 
     readings = [parse_rational(v, f"readings[{i}]") for i, v in enumerate(raw_readings)]
 
+    # Stage one keeps the original verdict: exact consistency is adjudicated
+    # over the complete graph, and reachability is decided before any
+    # single-relation exclusion is considered.
     total = _solve_component(relations, source).get(target)
     if total is None:
         raise Unreachable(source, target)
 
+    # Stage two: with a consistent, reachable graph, revoke each relation one
+    # at a time and demand that source and target stay connected. Parallel
+    # relations carry distinct ids and therefore count as independent chains.
+    if resilience_mode == "single_relation":
+        critical = _critical_relation_ids(relations, source, target)
+        if critical:
+            raise ResilienceNotMet(source, target, critical)
+
     results = [total.apply(x) for x in readings]
-    return TranslationResult(source, target, total, readings, results)
+    return TranslationResult(
+        source,
+        target,
+        total,
+        readings,
+        results,
+        resilience_mode=resilience_mode,
+        resilience_verified=resilience_mode is not None,
+    )
+
+
+def _adjacency(
+    relations: Iterable[Relation],
+) -> dict[str, list[tuple[str, Affine]]]:
+    """Build the undirected adjacency map with inverse traversal edges."""
+    adjacency: dict[str, list[tuple[str, Affine]]] = {}
+    for rel in relations:
+        u, v, forward = rel.as_adjacency()
+        adjacency.setdefault(u, []).append((v, forward))
+        adjacency.setdefault(v, []).append((u, forward.inverse()))
+    return adjacency
+
+
+def _critical_relation_ids(
+    relations: Sequence[Relation], source: str, target: str
+) -> list[str]:
+    """Return sorted ids of relations whose revocation disconnects the pair.
+
+    Each relation is removed in turn (both its directed assertion and its
+    usable inverse); if source can no longer reach target without it, that
+    relation sits on every evidence chain and is reported as critical.
+    Parallel relations between the same two instruments are distinct
+    relations with distinct ids, so each is tested separately and either one
+    can carry the conversion while the other is revoked.
+    """
+    critical: list[str] = []
+    for index, rel in enumerate(relations):
+        retained = relations[:index] + relations[index + 1 :]
+        adjacency = _adjacency(retained)
+        if not _reachable(adjacency, source, target):
+            assert rel.relation_id is not None
+            critical.append(rel.relation_id)
+    return sorted(set(critical))
+
+
+def _reachable(
+    adjacency: Mapping[str, Sequence[tuple[str, Affine]]], source: str, target: str
+) -> bool:
+    """Plain connectivity check; coefficient consistency is already settled."""
+    seen = {source}
+    stack = [source]
+    while stack:
+        node = stack.pop()
+        if node == target:
+            return True
+        for neighbour, _edge_tf in adjacency.get(node, ()):
+            if neighbour not in seen:
+                seen.add(neighbour)
+                stack.append(neighbour)
+    return False
 
 
 def _solve_component(relations: Iterable[Relation], source: str) -> dict[str, Affine]:
@@ -253,11 +376,7 @@ def _solve_component(relations: Iterable[Relation], source: str) -> dict[str, Af
     cycle.
     """
     # adjacency: node -> list of (neighbour, transform node->neighbour)
-    adjacency: dict[str, list[tuple[str, Affine]]] = {}
-    for rel in relations:
-        u, v, forward = rel.as_adjacency()
-        adjacency.setdefault(u, []).append((v, forward))
-        adjacency.setdefault(v, []).append((u, forward.inverse()))
+    adjacency = _adjacency(relations)
 
     # Deterministic traversal regardless of the caller's relation ordering.
     for neighbours in adjacency.values():

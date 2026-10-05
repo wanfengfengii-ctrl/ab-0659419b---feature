@@ -84,6 +84,10 @@ class CalibrationHandler(BaseHTTPRequestHandler):
             elif exc.code == "unreachable":
                 error["source"] = exc.source  # type: ignore[attr-defined]
                 error["target"] = exc.target  # type: ignore[attr-defined]
+            elif exc.code == "resilience_not_met":
+                # No coefficients or translated values are returned: the
+                # evidence chain is not strong enough to release them.
+                error["criticalRelationIds"] = exc.critical_relation_ids  # type: ignore[attr-defined]
             self._send_json(exc.status, {"error": error})
             return
         except Exception:  # pragma: no cover - defensive
