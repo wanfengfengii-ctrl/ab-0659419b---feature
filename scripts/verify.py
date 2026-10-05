@@ -5,8 +5,10 @@ Runs after the API container is healthy (see docker-compose.yml) and:
 1. runs the code test suite,
 2. performs a build sanity check (byte-compilation of every module),
 3. exercises the HTTP API with a consistent chain (including two paths
-   that must agree), a contradictory cycle, an unreachable pair and an
-   invalid relation,
+   that must agree), a contradictory cycle, an unreachable pair, an
+   invalid relation, and the resilience="single_relation" adjudication
+   (verified redundancy, critical relations, conflict priority and the
+   legacy contract without the resilience flag),
 
 then prints a summary and exits non-zero if anything failed.
 """
@@ -90,7 +92,8 @@ def smoke() -> None:
         "consistent chain returns 200 and exact transform",
         status == 200
         and body.get("coefficients") == {"a": "1", "b": "5/6"}
-        and body.get("results") == ["5/6", "11/6", "10/3"],
+        and body.get("results") == ["5/6", "11/6", "10/3"]
+        and "resilience" not in body,
         f"status={status} body={body}",
     )
 
@@ -163,6 +166,71 @@ def smoke() -> None:
     check(
         "zero multiplier is rejected",
         status == 400 and body.get("error", {}).get("code") == "invalid_request",
+        f"status={status} body={body}",
+    )
+
+    resilient = {
+        "source": "A",
+        "target": "C",
+        "resilience": "single_relation",
+        "relations": [
+            {"from": "A", "to": "B", "a": "2", "b": "1", "relationId": "ab"},
+            {"from": "A", "to": "D", "a": "4", "b": "2", "relationId": "ad"},
+            {"from": "B", "to": "C", "a": "1/2", "b": "1/3", "relationId": "bc"},
+            {"from": "D", "to": "C", "a": "1/4", "b": "1/3", "relationId": "dc"},
+        ],
+        "readings": ["2"],
+    }
+    status, body = post(resilient)
+    check(
+        "redundant diamond survives any single relation loss",
+        status == 200
+        and body.get("resilience") == {"verified": True}
+        and body.get("coefficients") == {"a": "1", "b": "5/6"}
+        and body.get("results") == ["17/6"],
+        f"status={status} body={body}",
+    )
+
+    critical = {
+        "source": "A",
+        "target": "C",
+        "resilience": "single_relation",
+        "relations": [
+            {"from": "B", "to": "C", "a": "1/2", "b": "1/3", "relationId": "bc"},
+            {"from": "A", "to": "B", "a": "2", "b": "1", "relationId": "ab"},
+        ],
+        "readings": ["2"],
+    }
+    status, body = post(critical)
+    error = body.get("error", {})
+    check(
+        "critical relations reported (422, sorted ids, no coefficients/results)",
+        status == 422
+        and error.get("code") == "resilience_not_met"
+        and error.get("criticalRelationIds") == ["ab", "bc"]
+        and "coefficients" not in body
+        and "results" not in body,
+        f"status={status} body={body}",
+    )
+
+    contradictory_resilient = {
+        "source": "A",
+        "target": "C",
+        "resilience": "single_relation",
+        "relations": [
+            {"from": "A", "to": "B", "a": "2", "b": "1", "relationId": "ab"},
+            {"from": "B", "to": "C", "a": "3", "b": "0", "relationId": "bc"},
+            {"from": "C", "to": "A", "a": "1/6", "b": "0", "relationId": "ca"},
+        ],
+        "readings": ["1"],
+    }
+    status, body = post(contradictory_resilient)
+    error = body.get("error", {})
+    check(
+        "conflict still takes priority over resilience adjudication (409)",
+        status == 409
+        and error.get("code") == "conflict"
+        and "results" not in body,
         f"status={status} body={body}",
     )
 

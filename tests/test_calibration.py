@@ -147,6 +147,130 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(r.to_json()["results"], ["17/6"])
 
 
+def REL(frm, to, a, b, rid):
+    """A relation carrying a relationId, as required by resilience mode."""
+    return {"from": frm, "to": to, "a": a, "b": b, "relationId": rid}
+
+
+# Diamond: A->C has two independent paths, so no single relation is critical.
+RESILIENT_DIAMOND = [
+    REL("A", "B", "2", "1", "ab"),
+    REL("A", "D", "4", "2", "ad"),
+    REL("B", "C", "1/2", "1/3", "bc"),
+    REL("D", "C", "1/4", "1/3", "dc"),
+]
+
+
+class ResilienceTests(unittest.TestCase):
+    def test_redundant_diamond_verified(self):
+        r = cal.translate(P(relations=RESILIENT_DIAMOND, resilience="single_relation"))
+        self.assertTrue(r.resilience_verified)
+        self.assertEqual(r.transform, cal.Affine(Fraction(1), Fraction(5, 6)))
+        self.assertEqual(r.readings_out, [Fraction(5, 6), Fraction(11, 6), Fraction(10, 3)])
+        body = r.to_json()
+        self.assertEqual(body["resilience"], {"verified": True})
+        self.assertEqual(body["coefficients"], {"a": "1", "b": "5/6"})
+        self.assertEqual(body["results"], ["5/6", "11/6", "10/3"])
+
+    def test_parallel_relations_are_independent_evidence(self):
+        # Two parallel relations per hop: revoking any single one leaves the
+        # other as an independent evidence chain for the same transform.
+        rels = [
+            REL("A", "B", "2", "1", "ab-1"),
+            REL("A", "B", "2", "1", "ab-2"),
+            REL("B", "C", "1/2", "1/3", "bc-1"),
+            REL("B", "C", "1/2", "1/3", "bc-2"),
+        ]
+        r = cal.translate(P(relations=rels, resilience="single_relation"))
+        self.assertTrue(r.resilience_verified)
+        self.assertEqual(r.transform.b, Fraction(5, 6))
+
+    def test_plain_chain_has_only_critical_relations(self):
+        rels = [
+            REL("A", "B", "2", "1", "ab"),
+            REL("B", "C", "1/2", "1/3", "bc"),
+        ]
+        with self.assertRaises(cal.ResilienceNotMet) as ctx:
+            cal.translate(P(relations=rels, resilience="single_relation"))
+        self.assertEqual(ctx.exception.code, "resilience_not_met")
+        self.assertEqual(ctx.exception.status, 422)
+        self.assertEqual(ctx.exception.critical_relation_ids, ["ab", "bc"])
+
+    def test_only_bridge_relation_is_critical(self):
+        # Diamond A->C is redundant, but the C->E tail is a single point of
+        # failure when translating A->E.
+        rels = RESILIENT_DIAMOND + [REL("C", "E", "1", "0", "ce")]
+        with self.assertRaises(cal.ResilienceNotMet) as ctx:
+            cal.translate(
+                P(relations=rels, target="E", resilience="single_relation")
+            )
+        self.assertEqual(ctx.exception.critical_relation_ids, ["ce"])
+
+    def test_critical_ids_sorted_by_id_not_entry_order(self):
+        rels = [
+            REL("A", "B", "1", "0", "r10"),
+            REL("B", "C", "1", "0", "r2"),
+            REL("C", "D", "1", "0", "r1"),
+        ]
+        with self.assertRaises(cal.ResilienceNotMet) as ctx:
+            cal.translate(
+                P(relations=rels, target="D", resilience="single_relation")
+            )
+        self.assertEqual(ctx.exception.critical_relation_ids, ["r1", "r10", "r2"])
+
+    def test_conflict_takes_priority_over_resilience(self):
+        rels = [
+            REL("A", "B", "2", "1", "ab"),
+            REL("B", "C", "3", "0", "bc"),
+            REL("C", "A", "1/6", "0", "ca"),
+        ]
+        with self.assertRaises(cal.CalibrationConflict):
+            cal.translate(P(relations=rels, resilience="single_relation"))
+
+    def test_unreachable_takes_priority_over_resilience(self):
+        rels = [
+            REL("A", "B", "2", "1", "ab"),
+            REL("D", "E", "1", "0", "de"),
+        ]
+        with self.assertRaises(cal.Unreachable):
+            cal.translate(P(relations=rels, target="E", resilience="single_relation"))
+
+    def test_relation_id_required_and_unique_when_enabled(self):
+        with self.assertRaises(cal.InvalidRequest):  # missing relationId
+            cal.translate(
+                P(
+                    relations=[{"from": "A", "to": "B", "a": "1", "b": "0"}],
+                    target="B",
+                    resilience="single_relation",
+                )
+            )
+        with self.assertRaises(cal.InvalidRequest):  # blank relationId
+            cal.translate(
+                P(relations=[REL("A", "B", "1", "0", "  ")], target="B",
+                  resilience="single_relation")
+            )
+        with self.assertRaises(cal.InvalidRequest):  # duplicate relationId
+            cal.translate(
+                P(
+                    relations=[REL("A", "B", "1", "0", "x"), REL("B", "C", "1", "0", "x")],
+                    resilience="single_relation",
+                )
+            )
+        with self.assertRaises(cal.InvalidRequest):  # unsupported mode
+            cal.translate(P(resilience="double_relation"))
+
+    def test_omitted_resilience_keeps_original_contract(self):
+        # No relationId needed and no resilience block in the response.
+        r = cal.translate(P())
+        self.assertFalse(r.resilience_verified)
+        self.assertNotIn("resilience", r.to_json())
+        # A stray relationId without the resilience flag is simply ignored.
+        r = cal.translate(P(relations=[REL("A", "B", "2", "1", "ab"),
+                                       REL("B", "C", "1/2", "1/3", "bc")]))
+        self.assertEqual(r.transform.b, Fraction(5, 6))
+        self.assertNotIn("resilience", r.to_json())
+
+
 class HttpSmokeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -209,6 +333,49 @@ class HttpSmokeTests(unittest.TestCase):
         status, body = self._post(P(relations=rels, target="E"))
         self.assertEqual(status, 404)
         self.assertEqual(body["error"]["code"], "unreachable")
+
+    def test_resilience_verified_over_http(self):
+        status, body = self._post(
+            P(relations=RESILIENT_DIAMOND, resilience="single_relation")
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["resilience"], {"verified": True})
+        self.assertEqual(body["coefficients"], {"a": "1", "b": "5/6"})
+        self.assertEqual(body["results"], ["5/6", "11/6", "10/3"])
+
+    def test_resilience_not_met_over_http(self):
+        rels = [
+            REL("B", "C", "1/2", "1/3", "bc"),
+            REL("A", "B", "2", "1", "ab"),
+        ]
+        status, body = self._post(P(relations=rels, resilience="single_relation"))
+        self.assertEqual(status, 422)
+        error = body["error"]
+        self.assertEqual(error["code"], "resilience_not_met")
+        self.assertEqual(error["criticalRelationIds"], ["ab", "bc"])
+        self.assertNotIn("coefficients", body)
+        self.assertNotIn("results", body)
+
+    def test_conflict_priority_over_http(self):
+        rels = [
+            REL("A", "B", "2", "1", "ab"),
+            REL("B", "C", "3", "0", "bc"),
+            REL("C", "A", "1/6", "0", "ca"),
+        ]
+        status, body = self._post(P(relations=rels, resilience="single_relation"))
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "conflict")
+        self.assertNotIn("results", body)
+
+    def test_legacy_request_has_no_resilience_block(self):
+        status, body = self._post(P())
+        self.assertEqual(status, 200)
+        self.assertNotIn("resilience", body)
+
+    def test_missing_relation_id_rejected_over_http(self):
+        status, body = self._post(P(resilience="single_relation"))
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "invalid_request")
 
 
 if __name__ == "__main__":

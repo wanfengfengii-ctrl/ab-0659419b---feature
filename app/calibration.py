@@ -22,6 +22,10 @@ MAX_INSTRUMENTS = 50
 MAX_RELATIONS = 100
 MAX_READINGS = 10_000
 
+# Optional resilience mode: the translation must survive the revocation of
+# any single calibration relation.
+RESILIENCE_SINGLE_RELATION = "single_relation"
+
 
 class CalibrationError(Exception):
     """Base class for calibration request failures."""
@@ -61,6 +65,24 @@ class CalibrationConflict(CalibrationError):
         self.detail = detail
 
 
+class ResilienceNotMet(CalibrationError):
+    """Redundancy was requested, but losing one relation breaks the path.
+
+    Carries every relation whose individual removal disconnects source from
+    target, sorted by relation id.
+    """
+
+    code = "resilience_not_met"
+    status = 422
+
+    def __init__(self, critical_relation_ids: Sequence[str]) -> None:
+        self.critical_relation_ids = sorted(critical_relation_ids)
+        super().__init__(
+            "translation has no independent evidence chain without relation(s): "
+            + ", ".join(self.critical_relation_ids)
+        )
+
+
 @dataclass(frozen=True)
 class Affine:
     """An affine transform ``y = a*x + b`` with exact rational coefficients."""
@@ -90,6 +112,7 @@ class Relation:
     to: str
     a: Fraction
     b: Fraction
+    relation_id: str | None = None
 
     def as_adjacency(self) -> tuple[str, str, Affine]:
         return self.frm, self.to, Affine(self.a, self.b)
@@ -169,9 +192,10 @@ class TranslationResult:
     transform: Affine
     readings_in: list[Fraction] = field(default_factory=list)
     readings_out: list[Fraction] = field(default_factory=list)
+    resilience_verified: bool = False
 
     def to_json(self) -> dict:
-        return {
+        body = {
             "source": self.source,
             "target": self.target,
             "coefficients": {
@@ -181,15 +205,27 @@ class TranslationResult:
             "readings": [render_fraction(x) for x in self.readings_in],
             "results": [render_fraction(y) for y in self.readings_out],
         }
+        if self.resilience_verified:
+            body["resilience"] = {"verified": True}
+        return body
 
 
 def translate(payload: Mapping[str, object]) -> TranslationResult:
     """Validate a request and translate readings from source to target.
 
-    Raises :class:`InvalidRequest`, :class:`Unreachable` or
-    :class:`CalibrationConflict`.  The answer never depends on the order in
-    which relations were entered: every edge is checked against every path
-    already derived, and a mismatch rejects the whole request.
+    Raises :class:`InvalidRequest`, :class:`Unreachable`,
+    :class:`CalibrationConflict` or :class:`ResilienceNotMet`.  The answer
+    never depends on the order in which relations were entered: every edge is
+    checked against every path already derived, and a mismatch rejects the
+    whole request.
+
+    When the payload carries ``resilience="single_relation"`` every relation
+    must declare a unique non-empty ``relationId``; after the usual exact
+    consistency and reachability adjudication, each relation is revoked in
+    turn and source/target must stay reachable through the remaining
+    relations, otherwise :class:`ResilienceNotMet` is raised with the sorted
+    ids of the relations whose loss breaks the translation.  Omitting
+    ``resilience`` keeps the original contract untouched.
     """
     if not isinstance(payload, Mapping):
         raise InvalidRequest("request body must be a JSON object")
@@ -206,8 +242,16 @@ def translate(payload: Mapping[str, object]) -> TranslationResult:
     target = _require_str(payload.get("target"), "field 'target'")
     raw_readings = _extract_readings(payload)
 
+    resilience = payload.get("resilience")
+    if resilience is not None and resilience != RESILIENCE_SINGLE_RELATION:
+        raise InvalidRequest(
+            f"field 'resilience' must be {RESILIENCE_SINGLE_RELATION!r} when provided"
+        )
+    resilience_requested = resilience is not None
+
     relations: list[Relation] = []
     vertices: set[str] = set()
+    seen_relation_ids: set[str] = set()
     for index, item in enumerate(relations_raw):
         where = f"relations[{index}]"
         if not isinstance(item, Mapping):
@@ -220,7 +264,16 @@ def translate(payload: Mapping[str, object]) -> TranslationResult:
         if a == 0:
             raise InvalidRequest(f"{where}.a must not be zero")
         b = parse_rational(item.get("b", 0), f"{where}.b")
-        relations.append(Relation(frm, to, a, b))
+        relation_id: str | None = None
+        if resilience_requested:
+            relation_id = _require_str(
+                item.get("relationId"),
+                f"{where}.relationId (required when resilience is requested)",
+            )
+            if relation_id in seen_relation_ids:
+                raise InvalidRequest(f"duplicate relationId {relation_id!r}")
+            seen_relation_ids.add(relation_id)
+        relations.append(Relation(frm, to, a, b, relation_id))
         vertices.add(frm)
         vertices.add(to)
 
@@ -240,8 +293,58 @@ def translate(payload: Mapping[str, object]) -> TranslationResult:
     if total is None:
         raise Unreachable(source, target)
 
+    resilience_verified = False
+    if resilience_requested:
+        critical = _critical_relations(relations, source, target)
+        if critical:
+            raise ResilienceNotMet(critical)
+        resilience_verified = True
+
     results = [total.apply(x) for x in readings]
-    return TranslationResult(source, target, total, readings, results)
+    return TranslationResult(source, target, total, readings, results, resilience_verified)
+
+
+def _critical_relations(
+    relations: Sequence[Relation], source: str, target: str
+) -> list[str]:
+    """Ids of relations whose individual removal disconnects source/target.
+
+    Each relation is excluded in turn and the remaining graph is probed for
+    an (undirected) source->target path.  Consistency of the reduced graphs
+    needs no re-check: a subgraph of an already consistent graph cannot
+    introduce a contradiction.  Parallel relations between the same pair of
+    instruments keep each other reachable, so they count as independent
+    evidence under their own ids.
+    """
+    critical: list[str] = []
+    for rel in relations:
+        if rel.relation_id is None:  # pragma: no cover - validated upstream
+            continue
+        reduced = [r for r in relations if r.relation_id != rel.relation_id]
+        if not _reachable(reduced, source, target):
+            critical.append(rel.relation_id)
+    return critical
+
+
+def _reachable(relations: Iterable[Relation], source: str, target: str) -> bool:
+    """Undirected reachability between two instruments."""
+    if source == target:
+        return True
+    adjacency: dict[str, list[str]] = {}
+    for rel in relations:
+        adjacency.setdefault(rel.frm, []).append(rel.to)
+        adjacency.setdefault(rel.to, []).append(rel.frm)
+    seen = {source}
+    stack = [source]
+    while stack:
+        node = stack.pop()
+        for neighbour in adjacency.get(node, ()):
+            if neighbour == target:
+                return True
+            if neighbour not in seen:
+                seen.add(neighbour)
+                stack.append(neighbour)
+    return False
 
 
 def _solve_component(relations: Iterable[Relation], source: str) -> dict[str, Affine]:
